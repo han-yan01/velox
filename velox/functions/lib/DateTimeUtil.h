@@ -396,4 +396,30 @@ FOLLY_ALWAYS_INLINE int64_t addToTime(int64_t time, int64_t valueInMillis) {
   }
   return newTime;
 }
+
+/// Truncates a TIME value to the specified unit. TIME represents milliseconds
+/// since midnight (0 to 86399999ms). Only time-related units (millisecond,
+/// second, minute, hour) are supported.
+FOLLY_ALWAYS_INLINE int64_t truncateTime(int64_t time, DateTimeUnit unit) {
+  VELOX_USER_CHECK(
+      time >= 0 && time < kMillisInDay,
+      "TIME value {} is out of range [0, 86400000)",
+      time);
+
+  // Validate that the unit is appropriate for TIME type
+  VELOX_USER_CHECK(isTimeUnit(unit), "Unsupported time unit for TIME type");
+
+  switch (unit) {
+    case DateTimeUnit::kMillisecond:
+      return time;
+    case DateTimeUnit::kSecond:
+      return (time / kMillisInSecond) * kMillisInSecond;
+    case DateTimeUnit::kMinute:
+      return (time / kMillisInMinute) * kMillisInMinute;
+    case DateTimeUnit::kHour:
+      return (time / kMillisInHour) * kMillisInHour;
+    default:
+      VELOX_UNREACHABLE();
+  }
+}
 } // namespace facebook::velox::functions

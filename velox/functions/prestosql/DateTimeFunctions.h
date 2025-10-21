@@ -1069,14 +1069,8 @@ inline std::optional<DateTimeUnit> getTimeUnit(
   std::optional<DateTimeUnit> unit =
       fromDateTimeUnitString(unitString, /*throwIfInvalid=*/false);
 
-  if (unit.has_value()) {
-    // Only allow time-related units for TIME type
-    if (unit.value() == DateTimeUnit::kMillisecond ||
-        unit.value() == DateTimeUnit::kSecond ||
-        unit.value() == DateTimeUnit::kMinute ||
-        unit.value() == DateTimeUnit::kHour) {
-      return unit;
-    }
+  if (unit.has_value() && isTimeUnit(unit.value())) {
+    return unit;
   }
 
   if (throwIfInvalid) {
@@ -1132,6 +1126,16 @@ struct DateTruncFunction : public TimestampWithTimezoneSupport<T> {
       const arg_type<TimestampWithTimezone>* /*timestamp*/) {
     if (unitString != nullptr) {
       unit_ = getTimestampUnit(*unitString);
+    }
+  }
+
+  FOLLY_ALWAYS_INLINE void initialize(
+      const std::vector<TypePtr>& /*inputTypes*/,
+      const core::QueryConfig& /*config*/,
+      const arg_type<Varchar>* unitString,
+      const arg_type<Time>* /*time*/) {
+    if (unitString != nullptr) {
+      unit_ = getTimeUnit(*unitString);
     }
   }
 
@@ -1215,6 +1219,19 @@ struct DateTruncFunction : public TimestampWithTimezoneSupport<T> {
     }
 
     result = pack(resultMillis, unpackZoneKeyId(*timestampWithTimezone));
+  }
+
+  FOLLY_ALWAYS_INLINE void call(
+      out_type<Time>& result,
+      const arg_type<Varchar>& unitString,
+      const arg_type<Time>& time) {
+    DateTimeUnit unit;
+    if (unit_.has_value()) {
+      unit = unit_.value();
+    } else {
+      unit = getTimeUnit(unitString).value();
+    }
+    result = truncateTime(time, unit);
   }
 };
 
