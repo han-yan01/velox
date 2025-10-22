@@ -18,6 +18,7 @@
 
 #include "velox/expression/CastExpr.h"
 #include "velox/functions/lib/DateTimeFormatter.h"
+#include "velox/functions/lib/TimeUtils.h"
 #include "velox/functions/prestosql/types/TimestampWithTimeZoneType.h"
 #include "velox/functions/prestosql/types/fuzzer_utils/TimestampWithTimeZoneInputGenerator.h"
 #include "velox/type/tz/TimeZoneMap.h"
@@ -72,6 +73,44 @@ void castFromDate(
     if (sessionTimeZone != nullptr) {
       ts.toGMT(*sessionTimeZone);
     }
+    rawResults[row] = pack(ts.toMillis(), sessionTimeZone->id());
+  });
+}
+
+void castFromTime(
+    const SimpleVector<int64_t>& inputVector,
+    exec::EvalCtx& context,
+    const SelectivityVector& rows,
+    int64_t* rawResults) {
+  const auto& config = context.execCtx()->queryCtx()->queryConfig();
+  const auto* sessionTimeZone = getTimeZoneFromConfig(config);
+
+  const auto sessionStartTimeMs = config.sessionStartTimeMs();
+
+  // Extract the date portion from session start time (in session timezone)
+  // If session start time is not set, use epoch (1970-01-01)
+  Timestamp sessionStartTs = Timestamp::fromMillis(sessionStartTimeMs);
+  if (sessionStartTimeMs != 0) {
+    // Convert from UTC to session timezone to get the local date
+    sessionStartTs.toTimezone(*sessionTimeZone);
+  }
+
+  // Calculate the start of the day (midnight) for the session start date
+  Timestamp dayStartTs = functions::adjustEpoch(
+      sessionStartTs.getSeconds(), functions::kSecondsInDay);
+
+  context.applyToSelectedNoThrow(rows, [&](vector_size_t row) {
+    const auto timeMillis = inputVector.valueAt(row);
+
+    // Combine the date from session start time with the time portion
+    Timestamp ts =
+        Timestamp::fromMillis(dayStartTs.getSeconds() * 1000 + timeMillis);
+
+    // Treat TIME as wall time in session time zone. This means that in
+    // order to get its UTC representation we need to shift the value by the
+    // offset of the time zone.
+    ts.toGMT(*sessionTimeZone);
+
     rawResults[row] = pack(ts.toMillis(), sessionTimeZone->id());
   });
 }
@@ -201,6 +240,8 @@ class TimestampWithTimeZoneCastOperator final : public exec::CastOperator {
         return true;
       case TypeKind::INTEGER:
         return other->isDate();
+      case TypeKind::BIGINT:
+        return other->isTime();
       default:
         return false;
     }
@@ -227,6 +268,49 @@ class TimestampWithTimeZoneCastOperator final : public exec::CastOperator {
       VectorPtr& result) const override {
     context.ensureWritable(rows, resultType, result);
 
+    // Optimization for constant TIME input vectors
+    if (input.typeKind() == TypeKind::BIGINT && input.type()->isTime() &&
+        input.isConstantEncoding()) {
+      auto constantInput = input.as<ConstantVector<int64_t>>();
+      if (constantInput->isNullAt(0)) {
+        result = BaseVector::createNullConstant(
+            resultType, rows.end(), context.pool());
+        return;
+      }
+
+      const auto& config = context.execCtx()->queryCtx()->queryConfig();
+      const auto* sessionTimeZone = getTimeZoneFromConfig(config);
+      const auto sessionStartTimeMs = config.sessionStartTimeMs();
+
+      // Extract the date portion from session start time (in session timezone)
+      // If session start time is not set, use epoch (1970-01-01)
+      Timestamp sessionStartTs = Timestamp::fromMillis(sessionStartTimeMs);
+      if (sessionStartTimeMs != 0) {
+        // Convert from UTC to session timezone to get the local date
+        sessionStartTs.toTimezone(*sessionTimeZone);
+      }
+
+      // Calculate the start of the day (midnight) for the session start date
+      Timestamp dayStartTs = functions::adjustEpoch(
+          sessionStartTs.getSeconds(), functions::kSecondsInDay);
+
+      const auto timeMillis = constantInput->valueAt(0);
+      // Combine the date from session start time with the time portion
+      Timestamp ts =
+          Timestamp::fromMillis(dayStartTs.getSeconds() * 1000 + timeMillis);
+
+      ts.toGMT(*sessionTimeZone);
+
+      auto packedValue = pack(ts.toMillis(), sessionTimeZone->id());
+      result = std::make_shared<ConstantVector<int64_t>>(
+          context.pool(),
+          rows.end(),
+          false, // isNull
+          resultType,
+          std::move(packedValue));
+      return;
+    }
+
     auto* timestampWithTzResult = result->asFlatVector<int64_t>();
     timestampWithTzResult->clearNulls(rows);
 
@@ -242,6 +326,10 @@ class TimestampWithTimeZoneCastOperator final : public exec::CastOperator {
       VELOX_CHECK(input.type()->isDate());
       const auto inputVector = input.as<SimpleVector<int32_t>>();
       castFromDate(*inputVector, context, rows, rawResults);
+    } else if (input.typeKind() == TypeKind::BIGINT) {
+      VELOX_CHECK(input.type()->isTime());
+      const auto inputVector = input.as<SimpleVector<int64_t>>();
+      castFromTime(*inputVector, context, rows, rawResults);
     } else {
       VELOX_UNSUPPORTED(
           "Cast from {} to TIMESTAMP WITH TIME ZONE not yet supported",
